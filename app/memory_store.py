@@ -1,22 +1,21 @@
 """
 Storage layer - Simple JSON + numpy based vector store.
 ChromaDB avoid kiya kyunki Windows pe C++ Build Tools maangta hai (chroma-hnswlib).
-Ye approach halka hai, koi native build nahi chahiye, aur hackathon demo ke liye kaafi fast hai.
+Local sentence-transformers/torch bhi avoid kiya kyunki naye Python versions ke saath
+compatibility issues aa rahe the — iski jagah Qwen ka embedding API use kar rahe hain.
+Ye approach halka hai, koi native build/heavy ML library nahi chahiye.
 """
 import json
 import os
 import time
 import numpy as np
-from sentence_transformers import SentenceTransformer
+from llm import get_embedding
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 MESSAGES_FILE = os.path.join(DATA_DIR, "messages.json")
 DECISIONS_FILE = os.path.join(DATA_DIR, "decisions.json")
-
-# Free local embedding model - koi API cost nahi, offline chalta hai
-_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 
 def _load(filepath):
@@ -32,7 +31,7 @@ def _save(filepath, data):
 
 
 def _embed(text: str):
-    return _model.encode(text).tolist()
+    return get_embedding(text)
 
 
 def _cosine_sim(a, b):
