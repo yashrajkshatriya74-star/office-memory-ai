@@ -12,6 +12,18 @@ QWEN_MODEL = os.getenv("QWEN_MODEL", "qwen-plus")
 
 client = OpenAI(api_key=QWEN_API_KEY, base_url=QWEN_BASE_URL)
 
+EMBEDDING_MODEL = "text-embedding-v3"
+
+
+def get_embedding(text: str) -> list:
+    """
+    Qwen/DashScope ke embedding API se vector nikalta hai.
+    Local sentence-transformers/torch ki jagah ye use kar rahe hain — halka hai,
+    koi heavy dependency nahi, aur Python version compatibility issues avoid karta hai.
+    """
+    response = client.embeddings.create(model=EMBEDDING_MODEL, input=text)
+    return response.data[0].embedding
+
 
 def ask_llm(system_prompt: str, user_prompt: str, max_tokens: int = 500) -> str:
     """Simple single-turn completion call."""
