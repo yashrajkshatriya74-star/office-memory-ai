@@ -5,6 +5,7 @@ Socket Mode use kar rahe hain, isliye koi public URL/hosting nahi chahiye local 
 Run: python app/main.py
 """
 import os
+import time
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -46,6 +47,58 @@ def answer_decision_question(question: str, channel: str) -> str:
     return answer_query(question, context_block)
 
 
+def process_incoming_text(text: str, channel: str, user: str, ts: str, say, client,
+                           thread_ts=None, answer_if_not_decision: bool = True):
+    """
+    Shared logic: har incoming text (channel message ya DM) do mein se ek hai —
+    (1) ek naya decision jo log karna hai, ya (2) ek sawal jiska jawab dena hai.
+    Pehle decision-check karte hain; decision na ho to hi question maan ke jawab dete hain.
+    Ye function normal channel messages aur DM fallback dono se use hota hai, taaki
+    dono jagah decisions sahi se detect + store ho sakein.
+
+    answer_if_not_decision=False rakho normal channel messages ke liye — warna bot har
+    non-decision channel message ko bhi "question" samajh ke reply karega (spam). DM/Assistant
+    panel mein ye True rehna chahiye, kyunki wahan har message ya to decision hai ya sawal.
+    """
+    # Har message ko general store mein daal do (future context ke liye)
+    store_message(channel, user, text, ts)
+
+    if is_decision_message(text):
+        summary = extract_decision_summary(text)
+
+        # Naya decision store karne se PEHLE, dekho kya isi topic pe pehle koi decision hai
+        similar_past = get_similar_past_decisions(text, channel)
+        contradiction_note = check_contradiction(text, similar_past) if similar_past else ""
+
+        store_decision(channel, user, text, summary["raw"], ts)
+
+        # React karke visually confirm karo ki bot ne isse "decision" mark kiya
+        # (DMs mein reactions_add fail ho sakta hai agar channel type support na kare, isliye guarded hai)
+        try:
+            client.reactions_add(channel=channel, timestamp=ts, name="brain")
+        except Exception:
+            pass  # agar already reacted ya permission issue, ignore silently
+
+        confirmation = (
+            f"📌 Decision logged and saved to memory. Ask `@OfficeMemoryAI` "
+            f"anytime to recall this decision and the reasoning behind it."
+        )
+
+        if contradiction_note:
+            confirmation += f"\n\n⚠️ {contradiction_note}"
+            try:
+                client.reactions_add(channel=channel, timestamp=ts, name="warning")
+            except Exception:
+                pass
+
+        say(text=confirmation, thread_ts=thread_ts)
+    elif answer_if_not_decision:
+        # Decision nahi hai, to question samajh ke answer do
+        answer = answer_decision_question(text, channel)
+        say(text=answer, thread_ts=thread_ts)
+    # else: normal channel chit-chat hai, decision bhi nahi — chup rehna hai (spam avoid)
+
+
 # ---------------------------------------------------------------------------
 # Slack AI Assistant side-panel (Slack's native "Agents & AI Apps" feature)
 # ---------------------------------------------------------------------------
@@ -71,14 +124,21 @@ def start_assistant_thread(say, set_suggested_prompts, logger):
 
 @assistant.user_message
 def respond_in_assistant_thread(payload, say, set_status, logger):
-    """Jab user AI Assistant panel mein koi sawal type karta hai."""
-    print(f"🟢 DEBUG: assistant user_message event received! Text: {payload.get('text')}")
+    """
+    Jab user AI Assistant panel mein kuch type karta hai — ye ek naya decision
+    ho sakta hai (jise store karna hai) ya ek sawal (jiska jawab dena hai).
+    process_incoming_text dono cases khud detect kar leta hai.
+    """
+    text = payload.get("text", "")
+    channel = payload.get("channel", "")
+    user = payload.get("user", "unknown")
+    ts = payload.get("ts") or payload.get("event_ts") or str(time.time())
+    print(f"🟢 DEBUG: assistant user_message event received! Text: {text}")
     try:
-        question = payload.get("text", "")
-        channel = payload.get("channel", "")
+        if not text.strip():
+            return
         set_status("Checking past decisions...")
-        answer = answer_decision_question(question, channel)
-        say(answer)
+        process_incoming_text(text, channel, user, ts, say, app.client)
     except Exception as e:
         logger.exception(f"Failed to respond in assistant thread: {e}")
         say("Sorry, something went wrong while looking that up.")
@@ -108,32 +168,17 @@ def handle_mention(event, say, client):
 @app.event("message")
 def handle_message(event, say, client):
     """
-    Har normal CHANNEL message pe chalta hai. Bot messages, edits, deletes ignore karte hain.
-    Decision-like message mile to store + tag karte hain.
+    Har incoming message pe chalta hai — channel ya DM dono. Bot messages, edits,
+    deletes ignore karte hain.
 
-    IMPORTANT: DM messages (channel ID 'D' se start hoti hai) yahan se skip kiye jate hain,
-    kyunki wo Assistant class (side-panel) exclusively handle karti hai. Agar ye skip nahi
-    karte, to generic handler DM messages ko bhi intercept kar leta tha aur Assistant
-    class ka code kabhi trigger hi nahi hota tha.
+    - Normal channel message: sirf decision-detect + store karta hai, chit-chat pe
+      chup rehta hai (sawaalon ka jawab sirf @mention se milta hai).
+    - DM (channel ID 'D' se start): Assistant class (side-panel) normally isse handle
+      karti hai, lekin agar assistant_thread_started event miss ho jaye (app restart
+      ke beech), to Bolt event yahan fallback mein aa jaata hai. Isliye yahan bhi
+      decision-detect pehle karte hain, phir hi question maan ke jawab dete hain.
     """
     channel = event["channel"]
-
-    if channel.startswith("D"):
-        # DM hai. Normally Assistant class (assistant.user_message) ise handle karti hai,
-        # lekin agar assistant_thread_started event kisi wajah se miss ho gaya ho
-        # (jaise app restart/crash ke beech mein), to Bolt is thread ko "assistant thread"
-        # ke roop mein recognize nahi karta aur events yahan generic handler tak aa jate hain.
-        # Isliye fallback: yahan bhi seedha answer de dete hain, taaki DM mein poocha gaya
-        # sawal kabhi bhi unanswered na rahe.
-        if event.get("subtype") is not None or event.get("bot_id"):
-            return
-        text = event.get("text", "")
-        if not text.strip():
-            return
-        print(f"🟡 DEBUG: DM fallback handling message: {text}")
-        answer = answer_decision_question(text, channel)
-        say(text=answer)
-        return
 
     # Skip bot's own messages, message edits/deletes, and messages with subtypes
     if event.get("subtype") is not None or event.get("bot_id"):
@@ -146,38 +191,22 @@ def handle_message(event, say, client):
     if not text.strip():
         return
 
-    # Har message ko general store mein daal do (future context ke liye)
-    store_message(channel, user, text, ts)
+    if channel.startswith("D"):
+        # DM hai. Normally Assistant class (assistant.user_message) ise handle karti hai,
+        # lekin agar assistant_thread_started event kisi wajah se miss ho gaya ho
+        # (jaise app restart/crash ke beech mein), to Bolt is thread ko "assistant thread"
+        # ke roop mein recognize nahi karta aur events yahan generic handler tak aa jate hain.
+        # Isliye fallback: yahan bhi PEHLE decision-check karte hain, phir hi question maan
+        # ke jawab dete hain — pehle ye seedha answer_decision_question call karta tha, jiski
+        # wajah se DM mein bheja gaya decision kabhi store hi nahi hota tha.
+        print(f"🟡 DEBUG: DM fallback handling message: {text}")
+        process_incoming_text(text, channel, user, ts, say, client)
+        return
 
-    # Ab check karo ki ye ek decision hai kya
-    if is_decision_message(text):
-        summary = extract_decision_summary(text)
-
-        # Naya decision store karne se PEHLE, dekho kya isi topic pe pehle koi decision hai
-        similar_past = get_similar_past_decisions(text, channel)
-        contradiction_note = check_contradiction(text, similar_past) if similar_past else ""
-
-        store_decision(channel, user, text, summary["raw"], ts)
-
-        # React karke visually confirm karo ki bot ne isse "decision" mark kiya
-        try:
-            client.reactions_add(channel=channel, timestamp=ts, name="brain")
-        except Exception:
-            pass  # agar already reacted ya permission issue, ignore silently
-
-        confirmation = (
-            f"📌 Decision logged and saved to memory. Ask `@OfficeMemoryAI` "
-            f"anytime to recall this decision and the reasoning behind it."
-        )
-
-        if contradiction_note:
-            confirmation += f"\n\n⚠️ {contradiction_note}"
-            try:
-                client.reactions_add(channel=channel, timestamp=ts, name="warning")
-            except Exception:
-                pass
-
-        say(text=confirmation, thread_ts=ts)
+    # Normal channel message: sirf decision-check + store karo. Random chit-chat pe reply nahi
+    # karna — sawaalon ka jawab sirf @mention se milta hai (handle_mention upar).
+    process_incoming_text(text, channel, user, ts, say, client, thread_ts=ts,
+                           answer_if_not_decision=False)
 
 
 if __name__ == "__main__":
